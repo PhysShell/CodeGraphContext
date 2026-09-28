@@ -666,7 +666,9 @@ class ScipIndexParser:
                         "return_type": return_type, "args": args,
                     }
 
-                    if kind in (26, 17):
+                    # scip-dotnet reports static methods and constructors with their own kinds; a
+                    # producer that reports 0 gets the same functions through the symbol-shape fallback.
+                    if kind in (Kind.Method, Kind.Function, Kind.StaticMethod, Kind.Constructor):
                         node.update({"cyclomatic_complexity": 1, "decorators": [], "context": None, "class_context": None})
                         file_data["functions"].append(node)
                     elif kind == 7:

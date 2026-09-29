@@ -55,6 +55,10 @@ def _normalize_prefix(p) -> str:
     return _normalize_path(p) + "/"
 
 
+# Rows per relationship-only UNWIND in write_scip_call_edges.
+SCIP_CALL_BATCH_SIZE = 500
+
+
 # These labels are deliberately global: one node per name, shared across files.
 # They are keyed on `name` alone and must not take a per-file disambiguator.
 _NAME_ONLY_MERGE_LABELS = {"Module", "DbTable", "ExternalClass"}
@@ -1706,46 +1710,57 @@ class GraphWriter:
         self, files_data: Dict[str, Any], name_from_symbol: Callable[[str], str]
     ) -> None:
         backend = get_backend_type(self.driver, self._db_manager)
-        def _work(session):
-            for file_data in files_data.values():
-                caller_labels = ("Function", "Variable", "Class", "Interface", "Trait", "Struct", "Record", "Union", "Mixin", "Extension")
-                callee_labels = ("Function", "Class", "Interface", "Trait", "Struct", "Enum", "Record", "Union", "Mixin", "Extension")
-                for edge in file_data.get("function_calls_scip", []):
-                    for clab in caller_labels:
-                        for calab in callee_labels:
-                            try:
-                                session.run(
-                                    f"""
-                                    MATCH (caller:`{clab}` {{name: $caller_name, path: $caller_file, line_number: $caller_line}})
-                                    MATCH (callee:`{calab}` {{name: $callee_name, path: $callee_file}})
-                                    MERGE (caller)-[:CALLS {{line_number: $ref_line, source: 'scip'}}]->(callee)
-                                """,
-                                    caller_name=name_from_symbol(edge["caller_symbol"]),
-                                    caller_file=edge["caller_file"],
-                                    caller_line=edge["caller_line"],
-                                    callee_name=edge["callee_name"],
-                                    callee_file=edge["callee_file"],
-                                    ref_line=edge["ref_line"],
-                                )
-                            except Exception as e:
-                                warning_logger(f"Failed to write SCIP call edge: {e}")
+        caller_labels = ("Function", "Variable", "Class", "Interface", "Trait", "Struct", "Record", "Union", "Mixin", "Extension")
+        callee_labels = ("Function", "Class", "Interface", "Trait", "Struct", "Enum", "Record", "Union", "Mixin", "Extension")
+        fn_rows, module_rows = [], []
+        for file_data in files_data.values():
+            for edge in file_data.get("function_calls_scip", []):
+                try:
+                    fn_rows.append({"caller_name": name_from_symbol(edge["caller_symbol"]), "caller_file": edge["caller_file"],
+                                    "caller_line": edge["caller_line"], "callee_name": edge["callee_name"],
+                                    "callee_file": edge["callee_file"], "ref_line": edge["ref_line"]})
+                except Exception as e:
+                    warning_logger(f"Failed to write SCIP call edge: {e}")
+            for edge in file_data.get("module_level_calls_scip", []):
+                try:
+                    module_rows.append({"caller_file": edge["caller_file"], "callee_name": edge["callee_name"],
+                                        "callee_file": edge["callee_file"], "ref_line": edge["ref_line"]})
+                except Exception as e:
+                    warning_logger(f"Failed to write SCIP module-level call edge: {e}")
 
-                for edge in file_data.get("module_level_calls_scip", []):
-                    for calab in callee_labels:
+        # One relationship-only UNWIND per fixed label pair and chunk instead of one query per edge and label
+        # pair: same label search space, same MATCH / MERGE, same raw path values.
+        def _write(session, rows, caller_match, calab, what):
+            query = f"""
+                UNWIND $rows AS row
+                {caller_match}
+                MATCH (callee:`{calab}` {{name: row.callee_name, path: row.callee_file}})
+                MERGE (caller)-[:CALLS {{line_number: row.ref_line, source: 'scip'}}]->(callee)
+            """
+            for i in range(0, len(rows), SCIP_CALL_BATCH_SIZE):
+                chunk = rows[i:i + SCIP_CALL_BATCH_SIZE]
+                try:
+                    session.run(query, rows=chunk)
+                except Exception as e:
+                    if _is_binder_exception(e):          # the label pair binds for no row at all
+                        warning_logger(f"Failed to write SCIP {what}: {e}")
+                        return
+                    for row in chunk:                    # a data-dependent failure must not drop the other rows
                         try:
-                            session.run(
-                                f"""
-                                MATCH (caller:File {{path: $caller_file}})
-                                MATCH (callee:`{calab}` {{name: $callee_name, path: $callee_file}})
-                                MERGE (caller)-[:CALLS {{line_number: $ref_line, source: 'scip'}}]->(callee)
-                            """,
-                                caller_file=edge["caller_file"],
-                                callee_name=edge["callee_name"],
-                                callee_file=edge["callee_file"],
-                                ref_line=edge["ref_line"],
-                            )
-                        except Exception as e:
-                            warning_logger(f"Failed to write SCIP module-level call edge: {e}")
+                            session.run(query, rows=[row])
+                        except Exception as e_row:
+                            warning_logger(f"Failed to write SCIP {what}: {e_row}")
+
+        def _work(session):
+            if fn_rows:
+                for clab in caller_labels:
+                    caller_match = (f"MATCH (caller:`{clab}` {{name: row.caller_name, path: row.caller_file, "
+                                    f"line_number: row.caller_line}})")
+                    for calab in callee_labels:
+                        _write(session, fn_rows, caller_match, calab, "call edge")
+            if module_rows:
+                for calab in callee_labels:
+                    _write(session, module_rows, "MATCH (caller:File {path: row.caller_file})", calab, "module-level call edge")
 
         execute_write_operation(self.driver, backend, _work)
     def delete_file_from_graph(self, path: str) -> None:

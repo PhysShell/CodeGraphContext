@@ -97,6 +97,20 @@ def _normalize_prefix(p) -> str:
 SCIP_CALL_BATCH_SIZE = 500
 
 
+def _function_spans(file_data: Dict[str, Any]) -> List[Tuple[int, int, str]]:
+    """(first line, last line, name) of every function in a file. The last line is the Tree-sitter end of the same
+    (name, line) recorded by the SCIP pipeline (`ts_function_ends`), else line + the source's line count."""
+    ts_end = {(n, ln): end for n, ln, end in file_data.get("ts_function_ends", [])}
+    spans = []
+    for f in file_data.get("functions", []):
+        line = f.get("line_number")
+        if not line or f.get("name") == "<module>":
+            continue
+        end = ts_end.get((f["name"], line)) or max(f.get("end_line") or line, line + (f.get("source") or "").count("\n"))
+        spans.append((line, end, f["name"]))
+    return spans
+
+
 # These labels are deliberately global: one node per name, shared across files.
 # They are keyed on `name` alone and must not take a per-file disambiguator.
 _NAME_ONLY_MERGE_LABELS = {"Module", "DbTable", "ExternalClass"}
@@ -1801,29 +1815,43 @@ class GraphWriter:
         backend = get_backend_type(self.driver, self._db_manager)
         caller_labels = ("Function", "Variable", "Class", "Interface", "Trait", "Struct", "Record", "Union", "Mixin", "Extension")
         callee_labels = ("Function", "Class", "Interface", "Trait", "Struct", "Enum", "Record", "Union", "Mixin", "Extension")
-        fn_rows, module_rows = [], []
+        fn_rows, enclosed_rows, module_rows = [], [], []
+        # Edge rows carry str(Path.resolve()) paths (backslashes on Windows); nodes are stored with _normalize_path.
+        paths: Dict[str, str] = {}
+        norm = lambda p: paths.setdefault(p, _normalize_path(p))
         for file_data in files_data.values():
+            spans = _function_spans(file_data)
             for edge in file_data.get("function_calls_scip", []):
                 try:
-                    fn_rows.append({"caller_name": name_from_symbol(edge["caller_symbol"]), "caller_file": edge["caller_file"],
+                    fn_rows.append({"caller_name": name_from_symbol(edge["caller_symbol"]), "caller_file": norm(edge["caller_file"]),
                                     "caller_line": edge["caller_line"], "callee_name": edge["callee_name"],
-                                    "callee_file": edge["callee_file"], "ref_line": edge["ref_line"]})
+                                    "callee_file": norm(edge["callee_file"]), "callee_line": edge.get("callee_line") or 0,
+                                    "ref_line": edge["ref_line"]})
                 except Exception as e:
                     warning_logger(f"Failed to write SCIP call edge: {e}")
             for edge in file_data.get("module_level_calls_scip", []):
                 try:
-                    module_rows.append({"caller_file": edge["caller_file"], "callee_name": edge["callee_name"],
-                                        "callee_file": edge["callee_file"], "ref_line": edge["ref_line"]})
+                    row = {"caller_file": norm(edge["caller_file"]), "callee_name": edge["callee_name"],
+                           "callee_file": norm(edge["callee_file"]), "callee_line": edge.get("callee_line") or 0,
+                           "ref_line": edge["ref_line"]}
+                    # No enclosing_range from the producer: the caller is the one function whose span holds the reference.
+                    hits = [s for s in spans if s[0] <= edge["ref_line"] <= s[1]]
+                    if len(hits) == 1:
+                        enclosed_rows.append({**row, "caller_line": hits[0][0], "caller_name": hits[0][2]})
+                    else:
+                        module_rows.append(row)
                 except Exception as e:
                     warning_logger(f"Failed to write SCIP module-level call edge: {e}")
 
         # One relationship-only UNWIND per fixed label pair and chunk instead of one query per edge and label
-        # pair: same label search space, same MATCH / MERGE, same raw path values.
+        # pair: same label search space, same MATCH / MERGE. A Function callee is identified by its definition line
+        # too, so same-named overloads in one file do not all become targets.
         def _write(session, rows, caller_match, calab, what):
+            line = ", line_number: row.callee_line" if calab == "Function" else ""
             query = f"""
                 UNWIND $rows AS row
                 {caller_match}
-                MATCH (callee:`{calab}` {{name: row.callee_name, path: row.callee_file}})
+                MATCH (callee:`{calab}` {{name: row.callee_name, path: row.callee_file{line}}})
                 MERGE (caller)-[:CALLS {{line_number: row.ref_line, source: 'scip'}}]->(callee)
             """
             for i in range(0, len(rows), SCIP_CALL_BATCH_SIZE):
@@ -1847,6 +1875,10 @@ class GraphWriter:
                                     f"line_number: row.caller_line}})")
                     for calab in callee_labels:
                         _write(session, fn_rows, caller_match, calab, "call edge")
+            if enclosed_rows:
+                caller_match = "MATCH (caller:Function {name: row.caller_name, path: row.caller_file, line_number: row.caller_line})"
+                for calab in callee_labels:
+                    _write(session, enclosed_rows, caller_match, calab, "enclosed call edge")
             if module_rows:
                 for calab in callee_labels:
                     _write(session, module_rows, "MATCH (caller:File {path: row.caller_file})", calab, "module-level call edge")

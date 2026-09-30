@@ -128,6 +128,9 @@ async def run_scip_index_async(
                     if "error" not in ts_data:
                         ts_funcs = {f["name"]: f for f in ts_data.get("functions", [])}
                         ts_funcs_at = {(f["name"], f["line_number"]): f for f in ts_data.get("functions", [])}
+                        # Real Tree-sitter ends for SCIP CALLS caller attribution only; the functions' own end_line is
+                        # left as SCIP gave it (Tree-sitter call resolution scopes variables by it).
+                        file_data["ts_function_ends"] = [[n, ln, f.get("end_line")] for (n, ln), f in ts_funcs_at.items()]
                         for f in file_data.get("functions", []):
                             ts_f = ts_funcs_at.get((f["name"], f["line_number"])) or ts_funcs.get(f["name"])
                             if ts_f:
